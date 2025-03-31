@@ -23,6 +23,8 @@
 #include <array>
 #include <vector>
 
+#include <unordered_map>
+
 using namespace dynamorio::drmemtrace;
 
 // -----------------------------------------------------------------------------
@@ -114,20 +116,6 @@ public:
 private:
     std::string set_decode_info_derived(void *dcontext, const _memref_instr_t &memref_instr,
                                           instr_t *instr, app_pc decode_pc) {
-        // char buf[196]; // MAX_INSTR_DIS_SZ is 196.
-        // const app_pc trace_pc = reinterpret_cast<app_pc>(memref_instr.addr);
-        // // byte *next_pc = disassemble_to_buffer(dcontext, decode_pc, trace_pc,
-        // //                                       false, true,
-        // //                                       buf, BUFFER_SIZE_ELEMENTS(buf), nullptr);
-        // byte *next_pc = decode_from_copy(dcontext, decode_pc, trace_pc,
-        //                                       false, true,
-        //                                       buf, BUFFER_SIZE_ELEMENTS(buf), nullptr);
-        // if (next_pc == nullptr) {
-        //     return "Failed to disassemble " + to_hex_string(memref_instr.addr);
-        // }
-        // disasm_ = "";
-        // // Uncomment for debugging:
-        // // std::cout << "Disassembly: " << disasm_ << std::endl;
         this->instr = instr;
         return "";
     }
@@ -151,7 +139,6 @@ init_decode_cache_and_set_flags(void* dcontext, scheduler_t::stream_t* stream) {
 // For non-branch instructions, we add an offset of 100 to registers;
 // for branch instructions, we use the register value as-is.
 
-// Normal register helpers (non-branch): add offset.
 bool addSrcRegister(input_instr &instr, int &srcCount, uint8_t reg, bool verbose) {
     if (srcCount >= 4) {
         if (verbose) std::cerr << "Too many source registers" << std::endl;
@@ -253,7 +240,6 @@ bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCoun
             srcCount = 0;
             if (!addSrcRegistersForBranch(input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
-            // For branch destination registers, reset dstCount and add without offset.
             dstCount = 0;
             if (!addDstRegistersForBranch(input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
@@ -278,7 +264,6 @@ bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCoun
                 return false;
             break;
         default:
-            // For unknown branch types, no extra registers are added.
             break;
     }
     return true;
@@ -286,32 +271,31 @@ bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCoun
 
 // -----------------------------------------------------------------------------
 // update_inst_registers: Update input_instr registers for the given instruction.
-// For non-branch parts, add offset (using addSrcRegister/addDstRegister).
-// For branch-specific assignments, call assignBranchRegisters (which uses branch helpers without offset).
 void update_inst_registers(void *dcontext, memref_t record, instr_t instr, input_instr &input_instr, bool verbose = false) {
     int srcCount = 0;
     int dstCount = 0;
     uint used_flag = instr_get_arith_flags(&instr, DR_QUERY_DEFAULT);
 
-    // Process non-branch source registers (with offset).
     for (int i = 0; i < instr_num_srcs(&instr); i++) {
         opnd_t opnd = instr_get_src(&instr, i);
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
-        if (verbose) std::cout << "src register: " << reg << std::endl;
+        if (verbose) {
+            std::cout << "src register: " << reg << std::endl;
+        }
         if (!addSrcRegister(input_instr, srcCount, reg, verbose))
-            return;  // Exit on fault.
+            return;
     }
 
-    // Process non-branch destination registers (with offset).
     for (int i = 0; i < instr_num_dsts(&instr); i++) {
         opnd_t opnd = instr_get_dst(&instr, i);
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
-        if (verbose) std::cout << "dst register: " << reg << std::endl;
+        if (verbose) {
+            std::cout << "dst register: " << reg << std::endl;
+        }
         if (!addDstRegister(input_instr, dstCount, reg, verbose))
             return;
     }
 
-    // Handle EFLAGS (non-branch: add offset).
     if (TESTANY(EFLAGS_WRITE_ARITH, used_flag)) {
         if (verbose) std::cout << "EFLAGS is written" << std::endl;
         if (!addDstRegisterForBranch(input_instr, dstCount, REG_FLAGS, verbose, BRANCH_INVALID))
@@ -323,20 +307,16 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t instr, input
             return;
     }
 
-    // If this is a plain instruction, we're done.
     if (record.instr.type == TRACE_TYPE_INSTR)
         return;
 
-    // For branch instructions, add the instruction pointer to destination registers using branch helper (no offset).
     {
         BranchType bType = getBranchType(record.instr.type);
-        // Reset dstCount for branch part.
         dstCount = 0;
         if (!addDstRegisterForBranch(input_instr, dstCount, REG_INSTRUCTION_POINTER, verbose, bType))
             return;
     }
 
-    // Now assign branch-specific registers (without offset).
     if (!assignBranchRegisters(input_instr, srcCount, dstCount, record.instr.type, verbose))
         return;
 }
@@ -378,12 +358,12 @@ void update_branch_info(memref_t record, input_instr &input_instr) {
 }
 
 // -----------------------------------------------------------------------------
-// simulate_core: Processes records from a given stream. Each thread writes binary
-// instruction records via gzwrite to an output file and updates per-thread statistics.
+// simulate_core: Processes records from a given stream.
 void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id, bool verbose,
                    SimStats &stats, const std::string &output_file_path,
                    const std::string &output_file_name) {
-    // Build output filename.
+
+    auto start_time = std::chrono::high_resolution_clock::now();
     std::string filename = output_file_path;
     if (!filename.empty() && filename.back() != '/' && filename.back() != '\\')
         filename += "/";
@@ -418,28 +398,21 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
             if (g_target_inst_count != 0 && count >= g_target_inst_count)
                 break;
             if (count % 100000 == 0) {
-                std::cout << "Processed " << count << " instructions\n";
+                auto elapsed_time = std::chrono::high_resolution_clock::now() - start_time;
+                double elapsed_seconds = std::chrono::duration<double>(elapsed_time).count();
+                std::cout << "Processed " << count << " instructions, " << " Core " <<  thread_id << " cache size: " 
+                          << decode_cache_->decode_cache_.size() << " Elapsed time: "
+                          << elapsed_seconds << " seconds" << ", MI/s: "
+                          << (count / 1000000.0) / elapsed_seconds << "\n";
             }
             stats.total_insts++;
-
-            // static instr_t* saved_instr = nullptr;
-            // disasm_info_t *disasm_info;
-            // instr_t instr;
-            
-            // if (saved_instr != nullptr) {
-            //     instr = *saved_instr;
+            // if (decode_cache_->decode_cache_.size() > 200000) {
+            //     std::cerr << "Cache size exceeded 200000, clearing cache\n";
+            //     decode_cache_->decode_cache_.clear();
             // }
-            // else {
-            //     std::string error_string = decode_cache_->add_decode_info(record.instr, disasm_info);
-            //     instr = *disasm_info->instr;
-            //     saved_instr = new instr_t;
-            //     *saved_instr = instr;
-            // }
-            
             disasm_info_t *disasm_info;
             std::string error_string = decode_cache_->add_decode_info(record.instr, disasm_info);
             instr_t instr = *disasm_info->instr;
-
             
             if (verbose) {
                 std::cout << std::left << std::setw(12) << "ifetch" << std::right
@@ -480,33 +453,29 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
                 }
                 if (new_record.instr.type == TRACE_TYPE_READ) {
                     inst.source_memory[inst_source_memory++] = new_record.instr.addr;
-                    assert (new_record.instr.addr != 0);
+                    assert(new_record.instr.addr != 0);
                 } else {
                     inst.destination_memory[inst_dest_memory++] = new_record.instr.addr;
-                    assert (new_record.instr.addr != 0);
+                    assert(new_record.instr.addr != 0);
                 }
                 status = stream->next_record(new_record);
             }
             gzwrite(gz_out, &inst, sizeof(inst));
             record = new_record;
-            // std::cout << inst.toCSV() << std::endl;
         } else {
             status = stream->next_record(record);
         }
-
     }
     gzclose(gz_out);
-
-    
 }
 
 // -----------------------------------------------------------------------------
-// run_scheduler: Spawns one thread per core, collects per-thread statistics, and
-// writes output files named: <output_file_path>/<output_file_name>_<thread_id>.champsim.gz
+// run_scheduler: Spawns one thread per core and writes output files.
 void run_scheduler(const std::string &trace_directory, bool verbose,
                    std::vector<SimStats> &all_stats,
                    const std::string &output_file_path,
-                   const std::string &output_file_name) {
+                   const std::string &output_file_name,
+                   int num_cores) {
     scheduler_t scheduler;
     std::vector<scheduler_t::input_workload_t> sched_inputs;
     sched_inputs.emplace_back(trace_directory);
@@ -514,20 +483,18 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     scheduler_t::scheduler_options_t sched_ops(scheduler_t::MAP_TO_ANY_OUTPUT,
                                                scheduler_t::DEPENDENCY_TIMESTAMPS,
                                                scheduler_t::SCHEDULER_DEFAULTS);
-    constexpr int NUM_CORES = 8; // Adjust as needed.
-    if (scheduler.init(sched_inputs, NUM_CORES, std::move(sched_ops)) != scheduler_t::STATUS_SUCCESS)
+    if (scheduler.init(sched_inputs, num_cores, std::move(sched_ops)) != scheduler_t::STATUS_SUCCESS)
         assert(false);
     
     void *dcontext = dr_standalone_init();
-    std::string error_string_;
     auto filetype_ = scheduler.get_stream(0)->get_filetype();
     
     if (TESTANY(OFFLINE_FILE_TYPE_ARCH_ALL & ~OFFLINE_FILE_TYPE_ARCH_REGDEPS, filetype_) &&
         !TESTANY(build_target_arch_type(), filetype_)) {
-        error_string_ = std::string("Architecture mismatch: trace recorded on ") +
-                        trace_arch_string(static_cast<offline_file_type_t>(filetype_)) +
-                        " but tool built for " +
-                        trace_arch_string(build_target_arch_type());
+        std::string error_string_ = std::string("Architecture mismatch: trace recorded on ") +
+                                    trace_arch_string(static_cast<offline_file_type_t>(filetype_)) +
+                                    " but tool built for " +
+                                    trace_arch_string(build_target_arch_type());
         std::cerr << error_string_ << std::endl;
     }
     
@@ -543,10 +510,10 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     }
     disassemble_set_syntax(flags);
 
-    all_stats.resize(NUM_CORES);
+    all_stats.resize(num_cores);
     std::vector<std::thread> threads;
-    threads.reserve(NUM_CORES);
-    for (int i = 0; i < NUM_CORES; ++i) {
+    threads.reserve(num_cores);
+    for (int i = 0; i < num_cores; ++i) {
         threads.emplace_back([dcontext, i, &scheduler, verbose, &all_stats, &output_file_path, &output_file_name]() {
             simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[i],
                           output_file_path, output_file_name);
@@ -564,19 +531,21 @@ int main(int argc, char *argv[]) {
     std::string output_file_name = "bravo";
     bool verbose = true;
     size_t target_count = 0;
+    int num_cores = 8; // Default number of cores
 
     int opt;
     int option_index = 0;
     static struct option long_options[] = {
         {"trace_folder",     required_argument, 0, 't'},
         {"output_file_path", required_argument, 0, 'p'},
-        {"output_file_name", required_argument, 0, 'n'},
+        {"output_file_name", required_argument, 0, 'f'},  // Changed from -n to -f.
+        {"num_cores",        required_argument, 0, 'n'},  // New option for number of cores.
         {"quiet",            no_argument,       0, 'q'},
         {"target_count",     required_argument, 0, 'c'},
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "t:p:n:qc:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:p:f:n:qc:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't':
                 trace_directory = optarg;
@@ -584,8 +553,11 @@ int main(int argc, char *argv[]) {
             case 'p':
                 output_file_path = optarg;
                 break;
-            case 'n':
+            case 'f':  // File name option.
                 output_file_name = optarg;
+                break;
+            case 'n':  // Number of cores option.
+                num_cores = std::stoi(optarg);
                 break;
             case 'q':
                 verbose = false;
@@ -595,7 +567,7 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 std::cerr << "Usage: " << argv[0]
-                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--quiet] [--target_count <num>]\n";
+                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--target_count <num>]\n";
                 return 1;
         }
     }
@@ -603,7 +575,7 @@ int main(int argc, char *argv[]) {
     if (trace_directory.empty()) {
         std::cerr << "Error: --trace_folder is required.\n";
         std::cerr << "Usage: " << argv[0]
-                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--quiet] [--target_count <num>]\n";
+                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--target_count <num>]\n";
         return 1;
     }
 
@@ -611,7 +583,7 @@ int main(int argc, char *argv[]) {
 
     std::vector<SimStats> thread_stats;
     auto start = std::chrono::high_resolution_clock::now();
-    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name);
+    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name, num_cores);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 
